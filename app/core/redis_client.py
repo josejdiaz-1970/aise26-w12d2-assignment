@@ -10,7 +10,11 @@ async def init_redis() -> redis_async.Redis:
         _redis = redis_async.Redis.from_url(
             settings.redis_url,
             decode_responses=True,
-        )
+            socket_timeout=5,
+            socket_connect_timeout=5,
+            retry_on_timeout=True,
+            ssl=settings.redis_url.startswith("rediss://"),
+        )    
     return _redis
 
 
