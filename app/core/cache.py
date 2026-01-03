@@ -4,6 +4,7 @@ from fastapi import Request
 from app.core.config import settings
 from app.core.redis_client import init_redis
 from typing import Any
+import logging
 
 
 def _cache_key_from_request(request: Request, prefix: str) -> str:
@@ -34,3 +35,14 @@ async def cache_invalidate_prefix(prefix: str) -> None:
     pattern = f"cache:{prefix}:*"
     async for k in r.scan_iter(match=pattern):
         await r.delete(k)
+
+
+#AI provided to address remote Redis availability and timeouts.ChaptGPT
+logger = logging.getLogger(__name__)
+
+async def safe_cache_call(fn, *args, **kwargs):
+    try:
+        return await fn(*args, **kwargs)
+    except Exception as e:
+        logger.warning("Cache unavailable", exc_info=e)
+        return None

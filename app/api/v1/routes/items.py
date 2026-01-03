@@ -1,33 +1,39 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import (
+    APIRouter,
+    Depends,
+    status,
+    Request,
+    BackgroundTasks,
+)
 from sqlalchemy.orm import Session
+import logging
+
 from app.db.session import get_db
 from app.db import crud
 from app.schemas.items import ItemCreate, ItemUpdate, ItemResponse
 from app.core.auth_dependencies import get_current_user, require_role
-from fastapi import Request
-from app.core.cache import cache_get, cache_set, cache_invalidate_prefix
-
+from app.core.cache import (
+    cache_get,
+    cache_set,
+    cache_invalidate_prefix,
+    safe_cache_call,
+)
 from app.services.external import fetch_quote
-from app.schemas.items import ItemResponse
-from fastapi import HTTPException
-from sqlalchemy.orm import Session
-from fastapi import Depends
-from app.db.session import get_db
-from app.db import crud
-
 from app.core.exceptions import NotFoundError
 
-#Background task - Temporary
 
-import logging
-from fastapi import BackgroundTasks
+router = APIRouter(
+    prefix="/items",
+    tags=["Items"],
+    dependencies=[Depends(get_current_user)],
+)
+
+logger = logging.getLogger(__name__)
 
 
-
-
-router = APIRouter(prefix="/items", tags=["Items"], dependencies=[Depends(get_current_user)])
-
-
+# --------------------
+# LIST ITEMS (cached)
+# --------------------
 @router.get("/", response_model=list[ItemResponse])
 async def list_items(
     request: Request,
@@ -37,21 +43,34 @@ async def list_items(
     sort: str | None = None,
     db: Session = Depends(get_db),
 ):
-    cached = await cache_get(request, prefix="items_list")
+    cached = await safe_cache_call(
+        cache_get,
+        request,
+        prefix="items_list",
+    )
     if cached is not None:
-        return cached  # FastAPI will validate/serialize to response_model
+        return cached
 
     items = crud.get_items(db, skip, limit, category, sort)
-    # Convert ORM objects to dicts for caching
+
     payload = [
-        ItemResponse.model_validate(i).model_dump(mode="json")
-        for i in items
+        ItemResponse.model_validate(item).model_dump(mode="json")
+        for item in items
     ]
 
-    await cache_set(request, prefix="items_list", payload=payload)
+    await safe_cache_call(
+        cache_set,
+        request,
+        prefix="items_list",
+        payload=payload,
+    )
+
     return payload
 
 
+# --------------------
+# GET SINGLE ITEM
+# --------------------
 @router.get("/{item_id}", response_model=ItemResponse)
 def get_item(item_id: str, db: Session = Depends(get_db)):
     item = crud.get_item(db, item_id)
@@ -59,6 +78,10 @@ def get_item(item_id: str, db: Session = Depends(get_db)):
         raise NotFoundError("Item not found")
     return item
 
+
+# --------------------
+# ENRICH ITEM (ASYNC)
+# --------------------
 @router.get("/{item_id}/enrich")
 async def enrich_item(item_id: str, db: Session = Depends(get_db)):
     item = crud.get_item(db, item_id)
@@ -75,8 +98,10 @@ async def enrich_item(item_id: str, db: Session = Depends(get_db)):
         },
     }
 
-#Patch endpoints
 
+# --------------------
+# UPDATE ITEM
+# --------------------
 @router.patch("/{item_id}", response_model=ItemResponse)
 async def update_item(
     item_id: str,
@@ -88,11 +113,18 @@ async def update_item(
         raise NotFoundError("Item not found")
 
     updated = crud.update_item(db, item, updates)
-    await cache_invalidate_prefix("items_list")
+
+    await safe_cache_call(
+        cache_invalidate_prefix,
+        "items_list",
+    )
+
     return updated
 
-# Delete endpoints
 
+# --------------------
+# DELETE ITEM (ADMIN)
+# --------------------
 @router.delete(
     "/{item_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -104,14 +136,19 @@ async def delete_item(item_id: str, db: Session = Depends(get_db)):
         raise NotFoundError("Item not found")
 
     crud.delete_item(db, item)
-    await cache_invalidate_prefix("items_list")
 
-# Background Task
+    await safe_cache_call(
+        cache_invalidate_prefix,
+        "items_list",
+    )
 
-logger = logging.getLogger(__name__)
 
+# --------------------
+# CREATE ITEM + AUDIT
+# --------------------
 def audit_log(event: str, item_id: str):
     logger.info({"audit": event, "item_id": item_id})
+
 
 @router.post("/", response_model=ItemResponse, status_code=status.HTTP_201_CREATED)
 async def create_item(
@@ -120,8 +157,16 @@ async def create_item(
     db: Session = Depends(get_db),
 ):
     created = crud.create_item(db, item)
-    background_tasks.add_task(audit_log, "item_created", str(created.id))
-    await cache_invalidate_prefix("items_list")
-    return created
 
-# End Background Task
+    background_tasks.add_task(
+        audit_log,
+        "item_created",
+        str(created.id),
+    )
+
+    await safe_cache_call(
+        cache_invalidate_prefix,
+        "items_list",
+    )
+
+    return created
